@@ -314,7 +314,7 @@ def health():
 @app.route(f"/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
+    bot_loop.call_soon_threadsafe(telegram_app.update_queue.put_nowait, update)
     return "ok"
 
 
@@ -331,11 +331,13 @@ def create_app():
 flask_app = create_app()
 
 
-@app.before_request
-def ensure_started():
-    if not telegram_app.running:
-        telegram_app.initialize()
-        telegram_app.start()
+import asyncio
+
+bot_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(bot_loop)
+
+bot_loop.run_until_complete(telegram_app.initialize())
+bot_loop.run_until_complete(telegram_app.start())
 
 
 if __name__ == "__main__":
