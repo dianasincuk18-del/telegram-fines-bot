@@ -696,6 +696,21 @@ def handle_callback(callback_query: Dict[str, Any]):
     message_id = message["message_id"]
     telegram_id = callback_query["from"]["id"]
 
+if action == "mgr":
+    edit_message(
+        chat_id,
+        message_id,
+        "👑 Кабінет керівника\n\nОберіть розділ:",
+        inline_keyboard([
+            [button("👥 Мої працівники", "mgr_employees")],
+            [button("📊 Підсумок по моїх людях", "mgr_summary")],
+            [button("💸 Штрафи моїх людей", "mgr_fines")],
+            [button("⚠️ Попередження моїх людей", "mgr_warnings")],
+            [button("⬅️ Назад в меню", "menu")]
+        ])
+    )
+    return
+    
     if action == "menu":
         edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard(telegram_id))
         return
