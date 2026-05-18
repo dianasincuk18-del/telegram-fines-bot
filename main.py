@@ -1,13 +1,11 @@
 import os
 import json
 import logging
-from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import gspread
 from flask import Flask, request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,10 +20,44 @@ SHEET_EMPLOYEES = os.environ.get("SHEET_EMPLOYEES", "Працівники")
 SHEET_LOGS = os.environ.get("SHEET_LOGS", "Логи")
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "telegram-webhook")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 app = Flask(__name__)
-telegram_app: Optional[Application] = None
+
+
+def tg(method: str, payload: Dict[str, Any]):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    r = requests.post(url, json=payload, timeout=20)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"ok": False, "text": r.text}
+    logger.info("Telegram %s response: %s", method, data)
+    return data
+
+
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg("sendMessage", payload)
+
+
+def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg("editMessageText", payload)
+
+
+def answer_callback(callback_query_id: str):
+    return tg("answerCallbackQuery", {"callback_query_id": callback_query_id})
 
 
 def get_client():
@@ -47,14 +79,17 @@ def normalize(value: Any) -> str:
 
 def find_col(headers: List[str], variants: List[str]) -> Optional[int]:
     clean = [h.strip().lower() for h in headers]
+
     for v in variants:
         v = v.strip().lower()
         if v in clean:
             return clean.index(v)
+
     for i, h in enumerate(clean):
         for v in variants:
             if v.strip().lower() in h:
                 return i
+
     return None
 
 
@@ -74,8 +109,10 @@ def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
         for row in values[1:]:
             if len(row) > tg_col and normalize(row[tg_col]) == str(telegram_id):
                 return normalize(row[name_col]) if len(row) > name_col else None
+
     except Exception as e:
         logger.exception(e)
+
     return None
 
 
@@ -175,19 +212,27 @@ def build_record_text(title: str, rec: Dict[str, Any], index: int, total: int, s
     return "\n".join(lines)
 
 
+def inline_keyboard(buttons: List[List[Dict[str, str]]]) -> Dict[str, Any]:
+    return {"inline_keyboard": buttons}
+
+
+def button(text: str, callback_data: str) -> Dict[str, str]:
+    return {"text": text, "callback_data": callback_data}
+
+
 def menu_keyboard():
-    return InlineKeyboardMarkup([
+    return inline_keyboard([
         [
-            InlineKeyboardButton("🆕 Нові штрафи", callback_data="new|fines"),
-            InlineKeyboardButton("⚠️ Нові попередження", callback_data="new|warnings"),
+            button("🆕 Нові штрафи", "new|fines"),
+            button("⚠️ Нові попередження", "new|warnings"),
         ],
-        [InlineKeyboardButton("📂 Штрафи по категоріях", callback_data="cats|fines")],
-        [InlineKeyboardButton("📁 Попередження по категоріях", callback_data="cats|warnings")],
+        [button("📂 Штрафи по категоріях", "cats|fines")],
+        [button("📁 Попередження по категоріях", "cats|warnings")],
     ])
 
 
 def back_menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu")]])
+    return inline_keyboard([[button("⬅️ Назад в меню", "menu")]])
 
 
 def sheet_by_code(code: str) -> str:
@@ -200,18 +245,13 @@ def title_by_code(code: str, category: Optional[str] = None) -> str:
     return "🆕 Нові штрафи" if code == "fines" else "⚠️ Нові попередження"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📋 Меню\n\nОберіть розділ:", reply_markup=menu_keyboard())
-
-
-async def show_records(query, code: str, index: int = 0, category: Optional[str] = None, only_new: bool = True):
+def show_records(chat_id: int, message_id: int, telegram_id: int, code: str, index: int = 0, category: Optional[str] = None, only_new: bool = True):
     sheet_name = sheet_by_code(code)
-    records = get_records(sheet_name, query.from_user.id, only_new=only_new, category=category)
+    records = get_records(sheet_name, telegram_id, only_new=only_new, category=category)
     title = title_by_code(code, category)
 
     if not records:
-        text = title + "\n\n✅ Записів немає."
-        await query.edit_message_text(text, reply_markup=back_menu_keyboard())
+        edit_message(chat_id, message_id, title + "\n\n✅ Записів немає.", back_menu_keyboard())
         return
 
     index = max(0, min(index, len(records) - 1))
@@ -222,22 +262,24 @@ async def show_records(query, code: str, index: int = 0, category: Optional[str]
     nav = []
 
     page_action = "catpage" if category else "page"
+
     if index > 0:
-        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"{page_action}|{code}|{index-1}|{category or ''}"))
+        nav.append(button("⬅️ Назад", f"{page_action}|{code}|{index - 1}|{category or ''}"))
     if index < len(records) - 1:
-        nav.append(InlineKeyboardButton("➡️ Далі", callback_data=f"{page_action}|{code}|{index+1}|{category or ''}"))
+        nav.append(button("➡️ Далі", f"{page_action}|{code}|{index + 1}|{category or ''}"))
+
     if nav:
         buttons.append(nav)
 
     if only_new and not category:
-        buttons.append([InlineKeyboardButton("✅ Переглянуто", callback_data=f"viewed|{code}|{rec['row_index']}")])
+        buttons.append([button("✅ Переглянуто", f"viewed|{code}|{rec['row_index']}")])
 
     if category:
-        buttons.append([InlineKeyboardButton("⬅️ До категорій", callback_data=f"cats|{code}")])
+        buttons.append([button("⬅️ До категорій", f"cats|{code}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu")])
+    buttons.append([button("⬅️ Назад в меню", "menu")])
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    edit_message(chat_id, message_id, text, inline_keyboard(buttons))
 
 
 def mark_viewed(sheet_name: str, row_index: int):
@@ -251,59 +293,74 @@ def mark_viewed(sheet_name: str, row_index: int):
     worksheet.update_cell(row_index, viewed_col + 1, "Так")
 
 
-async def show_categories(query, code: str):
+def show_categories(chat_id: int, message_id: int, telegram_id: int, code: str):
     sheet_name = sheet_by_code(code)
-    categories = get_categories(sheet_name, query.from_user.id)
+    categories = get_categories(sheet_name, telegram_id)
+
     title = "📂 Штрафи по категоріях" if code == "fines" else "📁 Попередження по категоріях"
 
     if not categories:
-        await query.edit_message_text(title + "\n\nКатегорій поки немає.", reply_markup=back_menu_keyboard())
+        edit_message(chat_id, message_id, title + "\n\nКатегорій поки немає.", back_menu_keyboard())
         return
 
-    buttons = [[InlineKeyboardButton("📌 " + cat, callback_data=f"catopen|{code}|{cat}")] for cat in categories]
-    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu")])
+    buttons = [[button("📌 " + cat, f"catopen|{code}|{cat}")] for cat in categories]
+    buttons.append([button("⬅️ Назад в меню", "menu")])
 
-    await query.edit_message_text(title + "\n\nОберіть категорію:", reply_markup=InlineKeyboardMarkup(buttons))
+    edit_message(chat_id, message_id, title + "\n\nОберіть категорію:", inline_keyboard(buttons))
 
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+def handle_callback(callback_query: Dict[str, Any]):
+    answer_callback(callback_query["id"])
 
+    data = callback_query.get("data", "")
     parts = data.split("|")
+
     action = parts[0]
+    message = callback_query["message"]
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+    telegram_id = callback_query["from"]["id"]
 
     if action == "menu":
-        await query.edit_message_text("📋 Меню\n\nОберіть розділ:", reply_markup=menu_keyboard())
+        edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
         return
 
     if action == "new":
-        await show_records(query, parts[1], 0, only_new=True)
+        show_records(chat_id, message_id, telegram_id, parts[1], 0, only_new=True)
         return
 
     if action == "page":
-        await show_records(query, parts[1], int(parts[2]), only_new=True)
+        show_records(chat_id, message_id, telegram_id, parts[1], int(parts[2]), only_new=True)
         return
 
     if action == "viewed":
         code = parts[1]
         row_index = int(parts[2])
         mark_viewed(sheet_by_code(code), row_index)
-        await show_records(query, code, 0, only_new=True)
+        show_records(chat_id, message_id, telegram_id, code, 0, only_new=True)
         return
 
     if action == "cats":
-        await show_categories(query, parts[1])
+        show_categories(chat_id, message_id, telegram_id, parts[1])
         return
 
     if action == "catopen":
-        await show_records(query, parts[1], 0, category=parts[2], only_new=False)
+        show_records(chat_id, message_id, telegram_id, parts[1], 0, category=parts[2], only_new=False)
         return
 
     if action == "catpage":
-        await show_records(query, parts[1], int(parts[2]), category=parts[3], only_new=False)
+        show_records(chat_id, message_id, telegram_id, parts[1], int(parts[2]), category=parts[3], only_new=False)
         return
+
+
+def handle_message(message: Dict[str, Any]):
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
+
+    if text in ["/start", "/menu", "старт", "Старт"]:
+        send_message(chat_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
+    else:
+        send_message(chat_id, "Напишіть /start, щоб відкрити меню.")
 
 
 @app.route("/")
@@ -313,33 +370,32 @@ def health():
 
 @app.route(f"/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    bot_loop.call_soon_threadsafe(telegram_app.update_queue.put_nowait, update)
+    update = request.get_json(force=True)
+    logger.info("Incoming update: %s", update)
+
+    try:
+        if "message" in update:
+            handle_message(update["message"])
+
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+
+    except Exception as e:
+        logger.exception(e)
+
+        try:
+            if "message" in update:
+                chat_id = update["message"]["chat"]["id"]
+            else:
+                chat_id = update["callback_query"]["message"]["chat"]["id"]
+
+            send_message(chat_id, "❌ Сталася помилка. Напишіть адміністратору або спробуйте ще раз.")
+        except Exception:
+            pass
+
     return "ok"
-
-
-def create_app():
-    global telegram_app
-
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler(["start", "menu"], start))
-    telegram_app.add_handler(CallbackQueryHandler(callback_handler))
-
-    return app
-
-
-flask_app = create_app()
-
-
-import asyncio
-
-bot_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(bot_loop)
-
-bot_loop.run_until_complete(telegram_app.initialize())
-bot_loop.run_until_complete(telegram_app.start())
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)
