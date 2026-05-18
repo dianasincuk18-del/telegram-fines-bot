@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-fines-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:flask_app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: WEBHOOK_SECRET
+        value: telegram-webhook
