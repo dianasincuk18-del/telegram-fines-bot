@@ -133,22 +133,6 @@ def button(text: str, callback_data: str) -> Dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
-def menu_keyboard(telegram_id: Optional[int] = None):
-    buttons = [
-        [
-            button("🆕 Нові штрафи", "new|f"),
-            button("⚠️ Нові попередження", "new|w"),
-        ],
-        [button("📂 Штрафи по категоріях", "months|f")],
-        [button("📁 Попередження по категоріях", "months|w")],
-    ]
-
-    if telegram_id and is_manager(telegram_id):
-        buttons.append([button("👑 Кабінет керівника", "mgr")])
-
-    return inline_keyboard(buttons)
-
-
 def back_menu_keyboard():
     return inline_keyboard([[button("⬅️ Назад в меню", "menu")]])
 
@@ -185,7 +169,6 @@ def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
         logger.exception(e)
 
     return None
-
 
 
 def get_employee_profile_by_tg(telegram_id: int) -> Optional[Dict[str, str]]:
@@ -227,6 +210,22 @@ def is_manager(telegram_id: int) -> bool:
     if not profile:
         return False
     return profile.get("role", "").strip().lower() == "керівник"
+
+
+def menu_keyboard(telegram_id: Optional[int] = None):
+    buttons = [
+        [
+            button("🆕 Нові штрафи", "new|f"),
+            button("⚠️ Нові попередження", "new|w"),
+        ],
+        [button("📂 Штрафи по категоріях", "months|f")],
+        [button("📁 Попередження по категоріях", "months|w")],
+    ]
+
+    if telegram_id and is_manager(telegram_id):
+        buttons.append([button("👑 Кабінет керівника", "mgr")])
+
+    return inline_keyboard(buttons)
 
 
 def get_manager_employees(manager_name: str) -> List[str]:
@@ -413,6 +412,7 @@ def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: 
     buttons.append([button("⬅️ Назад в меню", "menu")])
 
     edit_message(chat_id, message_id, text, inline_keyboard(buttons))
+
 
 def get_fixation_date_col(headers: List[str]) -> Optional[int]:
     return find_col(headers, [
@@ -696,21 +696,6 @@ def handle_callback(callback_query: Dict[str, Any]):
     message_id = message["message_id"]
     telegram_id = callback_query["from"]["id"]
 
-if action == "mgr":
-    edit_message(
-        chat_id,
-        message_id,
-        "👑 Кабінет керівника\n\nОберіть розділ:",
-        inline_keyboard([
-            [button("👥 Мої працівники", "mgr_employees")],
-            [button("📊 Підсумок по моїх людях", "mgr_summary")],
-            [button("💸 Штрафи моїх людей", "mgr_fines")],
-            [button("⚠️ Попередження моїх людей", "mgr_warnings")],
-            [button("⬅️ Назад в меню", "menu")]
-        ])
-    )
-    return
-    
     if action == "menu":
         edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard(telegram_id))
         return
@@ -751,6 +736,24 @@ if action == "mgr":
         month_key = parts[3]
         category_index = int(parts[4])
         show_records(chat_id, message_id, telegram_id, code, index, category_index=category_index, month_key=month_key, only_new=False)
+        return
+
+    if action == "mgr":
+        show_manager_cabinet(chat_id, message_id, telegram_id)
+        return
+
+    if action == "mgrlist":
+        show_manager_list(chat_id, message_id, telegram_id)
+        return
+
+    if action == "mgrsum":
+        show_manager_summary(chat_id, message_id, telegram_id)
+        return
+
+    if action == "mgrrec":
+        code = parts[1]
+        index = int(parts[2])
+        show_manager_records(chat_id, message_id, telegram_id, code, index)
         return
 
 
