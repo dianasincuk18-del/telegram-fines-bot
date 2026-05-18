@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import gspread
@@ -17,11 +18,15 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SHEET_FINES = os.environ.get("SHEET_FINES", "Штрафи")
 SHEET_WARNINGS = os.environ.get("SHEET_WARNINGS", "Попередження")
 SHEET_EMPLOYEES = os.environ.get("SHEET_EMPLOYEES", "Працівники")
-SHEET_LOGS = os.environ.get("SHEET_LOGS", "Логи")
-
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "telegram-webhook")
 
 app = Flask(__name__)
+
+MONTHS_UA = {
+    1: "Січень", 2: "Лютий", 3: "Березень", 4: "Квітень",
+    5: "Травень", 6: "Червень", 7: "Липень", 8: "Серпень",
+    9: "Вересень", 10: "Жовтень", 11: "Листопад", 12: "Грудень"
+}
 
 
 def tg(method: str, payload: Dict[str, Any]):
@@ -36,21 +41,14 @@ def tg(method: str, payload: Dict[str, Any]):
 
 
 def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-    }
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg("sendMessage", payload)
 
 
 def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-    }
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg("editMessageText", payload)
@@ -65,12 +63,8 @@ def get_client():
     return gspread.service_account_from_dict(creds)
 
 
-def get_spreadsheet():
-    return get_client().open_by_key(SPREADSHEET_ID)
-
-
 def ws(sheet_name: str):
-    return get_spreadsheet().worksheet(sheet_name)
+    return get_client().open_by_key(SPREADSHEET_ID).worksheet(sheet_name)
 
 
 def normalize(value: Any) -> str:
@@ -79,18 +73,51 @@ def normalize(value: Any) -> str:
 
 def find_col(headers: List[str], variants: List[str]) -> Optional[int]:
     clean = [h.strip().lower() for h in headers]
-
     for v in variants:
         v = v.strip().lower()
         if v in clean:
             return clean.index(v)
-
     for i, h in enumerate(clean):
         for v in variants:
             if v.strip().lower() in h:
                 return i
-
     return None
+
+
+def parse_date(value: str) -> Optional[datetime]:
+    value = normalize(value)
+    if not value:
+        return None
+    formats = ["%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%Y/%m/%d", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def month_key_from_date(value: str) -> Optional[str]:
+    d = parse_date(value)
+    if not d:
+        return None
+    return f"{d.year}-{d.month:02d}"
+
+
+def month_label(month_key: str) -> str:
+    year, month = month_key.split("-")
+    return f"{MONTHS_UA[int(month)]} {year}"
+
+
+def date_fixation_col(headers: List[str]) -> Optional[int]:
+    # ГОЛОВНЕ: фільтр місяця працює саме по даті фіксації ліда
+    return find_col(headers, [
+        "Дата фіксації ліда",
+        "Дата фиксации лида",
+        "Дата фіксації",
+        "Дата фиксации",
+        "Дата порушення",
+    ])
 
 
 def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
@@ -98,52 +125,42 @@ def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
         values = ws(SHEET_EMPLOYEES).get_all_values()
         if not values:
             return None
-
         headers = values[0]
         name_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Ім'я", "ПІБ співробітника"])
         tg_col = find_col(headers, ["Telegram ID", "Телеграм ID", "telegram_id", "tg id", "TG ID"])
-
         if name_col is None or tg_col is None:
             return None
-
         for row in values[1:]:
             if len(row) > tg_col and normalize(row[tg_col]) == str(telegram_id):
                 return normalize(row[name_col]) if len(row) > name_col else None
-
     except Exception as e:
         logger.exception(e)
-
     return None
 
 
-def get_records(sheet_name: str, telegram_id: int, only_new: bool = True, category: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_records(sheet_name: str, telegram_id: int, only_new: bool = True, category: Optional[str] = None, month_key: Optional[str] = None) -> List[Dict[str, Any]]:
     employee_name = get_employee_name_by_tg(telegram_id)
-
     values = ws(sheet_name).get_all_values()
     if not values:
         return []
 
     headers = values[0]
-
     employee_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
     tg_col = find_col(headers, ["Telegram ID", "Телеграм ID", "telegram_id", "tg id", "TG ID"])
     viewed_col = find_col(headers, ["Переглянуто", "Переглянутий", "Viewed", "Статус"])
     category_col = find_col(headers, ["Категорія", "Категория", "Тип"])
+    fixation_col = date_fixation_col(headers)
 
     result = []
-
     for row_index, row in enumerate(values[1:], start=2):
         def cell(col):
             return normalize(row[col]) if col is not None and len(row) > col else ""
 
         allowed = False
-
         if tg_col is not None and cell(tg_col) == str(telegram_id):
             allowed = True
-
         if not allowed and employee_name and employee_col is not None and cell(employee_col) == employee_name:
             allowed = True
-
         if not allowed:
             continue
 
@@ -153,38 +170,68 @@ def get_records(sheet_name: str, telegram_id: int, only_new: bool = True, catego
         if category and category_col is not None and cell(category_col) != category:
             continue
 
-        result.append({
-            "row_index": row_index,
-            "headers": headers,
-            "row": row,
-        })
+        if month_key:
+            if fixation_col is None:
+                continue
+            if month_key_from_date(cell(fixation_col)) != month_key:
+                continue
+
+        result.append({"row_index": row_index, "headers": headers, "row": row})
 
     return result
 
 
-def get_categories(sheet_name: str, telegram_id: int) -> List[str]:
-    records = get_records(sheet_name, telegram_id, only_new=False)
-    categories = set()
+def get_months(sheet_name: str, telegram_id: int) -> List[str]:
+    values = ws(sheet_name).get_all_values()
+    if not values:
+        return []
 
+    headers = values[0]
+    employee_name = get_employee_name_by_tg(telegram_id)
+    employee_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+    tg_col = find_col(headers, ["Telegram ID", "Телеграм ID", "telegram_id", "tg id", "TG ID"])
+    fixation_col = date_fixation_col(headers)
+
+    if fixation_col is None:
+        return []
+
+    months = set()
+    for row in values[1:]:
+        def cell(col):
+            return normalize(row[col]) if col is not None and len(row) > col else ""
+
+        allowed = False
+        if tg_col is not None and cell(tg_col) == str(telegram_id):
+            allowed = True
+        if not allowed and employee_name and employee_col is not None and cell(employee_col) == employee_name:
+            allowed = True
+        if not allowed:
+            continue
+
+        key = month_key_from_date(cell(fixation_col))
+        if key:
+            months.add(key)
+
+    return sorted(months, reverse=True)
+
+
+def get_categories(sheet_name: str, telegram_id: int, month_key: str) -> List[str]:
+    records = get_records(sheet_name, telegram_id, only_new=False, month_key=month_key)
+    categories = set()
     for rec in records:
-        headers = rec["headers"]
-        row = rec["row"]
-        category_col = find_col(headers, ["Категорія", "Категория", "Тип"])
-        if category_col is not None and len(row) > category_col:
-            category = normalize(row[category_col])
+        category_col = find_col(rec["headers"], ["Категорія", "Категория", "Тип"])
+        if category_col is not None and len(rec["row"]) > category_col:
+            category = normalize(rec["row"][category_col])
             if category:
                 categories.add(category)
-
     return sorted(categories)
 
 
 def get_value(rec: Dict[str, Any], variants: List[str]) -> str:
-    headers = rec["headers"]
-    row = rec["row"]
-    col = find_col(headers, variants)
-    if col is None or len(row) <= col:
+    col = find_col(rec["headers"], variants)
+    if col is None or len(rec["row"]) <= col:
         return "-"
-    return normalize(row[col]) or "-"
+    return normalize(rec["row"][col]) or "-"
 
 
 def build_record_text(title: str, rec: Dict[str, Any], index: int, total: int, sheet_name: str) -> str:
@@ -195,7 +242,7 @@ def build_record_text(title: str, rec: Dict[str, Any], index: int, total: int, s
         "",
         f"🆔 ID: {get_value(rec, ['ID', 'ID порушення', '№'])}",
         f"📅 Дата надходження: {get_value(rec, ['Дата надходження', 'Дата'])}",
-        f"📅 Дата фіксації: {get_value(rec, ['Дата фіксації', 'Дата порушення'])}",
+        f"📅 Дата фіксації ліда: {get_value(rec, ['Дата фіксації ліда', 'Дата фиксации лида', 'Дата фіксації', 'Дата порушення'])}",
         f"👤 Співробітник: {get_value(rec, ['Співробітник', 'ПІБ', 'Працівник', 'Менеджер'])}",
         f"📂 Категорія: {get_value(rec, ['Категорія', 'Категория', 'Тип'])}",
     ]
@@ -208,7 +255,6 @@ def build_record_text(title: str, rec: Dict[str, Any], index: int, total: int, s
         "",
         f"📝 Суть:\n{get_value(rec, ['Суть', 'Опис', 'Коментар', 'Причина'])}",
     ]
-
     return "\n".join(lines)
 
 
@@ -222,12 +268,9 @@ def button(text: str, callback_data: str) -> Dict[str, str]:
 
 def menu_keyboard():
     return inline_keyboard([
-        [
-            button("🆕 Нові штрафи", "new|fines"),
-            button("⚠️ Нові попередження", "new|warnings"),
-        ],
-        [button("📂 Штрафи по категоріях", "cats|fines")],
-        [button("📁 Попередження по категоріях", "cats|warnings")],
+        [button("🆕 Нові штрафи", "new|fines"), button("⚠️ Нові попередження", "new|warnings")],
+        [button("📂 Штрафи по категоріях", "months|fines")],
+        [button("📁 Попередження по категоріях", "months|warnings")],
     ])
 
 
@@ -239,16 +282,19 @@ def sheet_by_code(code: str) -> str:
     return SHEET_FINES if code == "fines" else SHEET_WARNINGS
 
 
-def title_by_code(code: str, category: Optional[str] = None) -> str:
+def title_by_code(code: str, category: Optional[str] = None, month_key: Optional[str] = None) -> str:
+    base = "📂 Штрафи" if code == "fines" else "📁 Попередження"
+    if category and month_key:
+        return f"{base}\n🗓 {month_label(month_key)}\n📌 {category}"
     if category:
-        return f"📂 Штрафи: {category}" if code == "fines" else f"📁 Попередження: {category}"
+        return f"{base}: {category}"
     return "🆕 Нові штрафи" if code == "fines" else "⚠️ Нові попередження"
 
 
-def show_records(chat_id: int, message_id: int, telegram_id: int, code: str, index: int = 0, category: Optional[str] = None, only_new: bool = True):
+def show_records(chat_id: int, message_id: int, telegram_id: int, code: str, index: int = 0, category: Optional[str] = None, month_key: Optional[str] = None, only_new: bool = True):
     sheet_name = sheet_by_code(code)
-    records = get_records(sheet_name, telegram_id, only_new=only_new, category=category)
-    title = title_by_code(code, category)
+    records = get_records(sheet_name, telegram_id, only_new=only_new, category=category, month_key=month_key)
+    title = title_by_code(code, category, month_key)
 
     if not records:
         edit_message(chat_id, message_id, title + "\n\n✅ Записів немає.", back_menu_keyboard())
@@ -260,25 +306,28 @@ def show_records(chat_id: int, message_id: int, telegram_id: int, code: str, ind
 
     buttons = []
     nav = []
-
-    page_action = "catpage" if category else "page"
+    if category and month_key:
+        page_action = "catpage"
+        extra = f"|{month_key}|{category}"
+    else:
+        page_action = "page"
+        extra = ""
 
     if index > 0:
-        nav.append(button("⬅️ Назад", f"{page_action}|{code}|{index - 1}|{category or ''}"))
+        nav.append(button("⬅️ Назад", f"{page_action}|{code}|{index - 1}{extra}"))
     if index < len(records) - 1:
-        nav.append(button("➡️ Далі", f"{page_action}|{code}|{index + 1}|{category or ''}"))
-
+        nav.append(button("➡️ Далі", f"{page_action}|{code}|{index + 1}{extra}"))
     if nav:
         buttons.append(nav)
 
     if only_new and not category:
         buttons.append([button("✅ Переглянуто", f"viewed|{code}|{rec['row_index']}")])
 
-    if category:
-        buttons.append([button("⬅️ До категорій", f"cats|{code}")])
+    if category and month_key:
+        buttons.append([button("⬅️ До категорій", f"cats|{code}|{month_key}")])
+        buttons.append([button("⬅️ До місяців", f"months|{code}")])
 
     buttons.append([button("⬅️ Назад в меню", "menu")])
-
     edit_message(chat_id, message_id, text, inline_keyboard(buttons))
 
 
@@ -286,35 +335,46 @@ def mark_viewed(sheet_name: str, row_index: int):
     worksheet = ws(sheet_name)
     headers = worksheet.row_values(1)
     viewed_col = find_col(headers, ["Переглянуто", "Переглянутий", "Viewed", "Статус"])
+    if viewed_col is not None:
+        worksheet.update_cell(row_index, viewed_col + 1, "Так")
 
-    if viewed_col is None:
+
+def show_months(chat_id: int, message_id: int, telegram_id: int, code: str):
+    sheet_name = sheet_by_code(code)
+    months = get_months(sheet_name, telegram_id)
+    title = "📂 Штрафи по категоріях" if code == "fines" else "📁 Попередження по категоріях"
+
+    if not months:
+        edit_message(chat_id, message_id, title + "\n\nМісяців не знайдено. Перевір колонку «Дата фіксації ліда».", back_menu_keyboard())
         return
 
-    worksheet.update_cell(row_index, viewed_col + 1, "Так")
+    buttons = [[button("🗓 " + month_label(m), f"cats|{code}|{m}")] for m in months]
+    buttons.append([button("⬅️ Назад в меню", "menu")])
+    edit_message(chat_id, message_id, title + "\n\n🗓 Оберіть місяць:", inline_keyboard(buttons))
 
 
-def show_categories(chat_id: int, message_id: int, telegram_id: int, code: str):
+def show_categories(chat_id: int, message_id: int, telegram_id: int, code: str, month_key: str):
     sheet_name = sheet_by_code(code)
-    categories = get_categories(sheet_name, telegram_id)
-
+    categories = get_categories(sheet_name, telegram_id, month_key)
     title = "📂 Штрафи по категоріях" if code == "fines" else "📁 Попередження по категоріях"
 
     if not categories:
-        edit_message(chat_id, message_id, title + "\n\nКатегорій поки немає.", back_menu_keyboard())
+        edit_message(chat_id, message_id, title + f"\n🗓 {month_label(month_key)}\n\nКатегорій за цей місяць немає.", inline_keyboard([
+            [button("⬅️ До місяців", f"months|{code}")],
+            [button("⬅️ Назад в меню", "menu")]
+        ]))
         return
 
-    buttons = [[button("📌 " + cat, f"catopen|{code}|{cat}")] for cat in categories]
+    buttons = [[button("📌 " + cat, f"catopen|{code}|{month_key}|{cat}")] for cat in categories]
+    buttons.append([button("⬅️ До місяців", f"months|{code}")])
     buttons.append([button("⬅️ Назад в меню", "menu")])
-
-    edit_message(chat_id, message_id, title + "\n\nОберіть категорію:", inline_keyboard(buttons))
+    edit_message(chat_id, message_id, title + f"\n🗓 {month_label(month_key)}\n\n📂 Оберіть категорію:", inline_keyboard(buttons))
 
 
 def handle_callback(callback_query: Dict[str, Any]):
     answer_callback(callback_query["id"])
-
     data = callback_query.get("data", "")
     parts = data.split("|")
-
     action = parts[0]
     message = callback_query["message"]
     chat_id = message["chat"]["id"]
@@ -323,40 +383,34 @@ def handle_callback(callback_query: Dict[str, Any]):
 
     if action == "menu":
         edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
-        return
-
-    if action == "new":
+    elif action == "new":
         show_records(chat_id, message_id, telegram_id, parts[1], 0, only_new=True)
-        return
-
-    if action == "page":
+    elif action == "page":
         show_records(chat_id, message_id, telegram_id, parts[1], int(parts[2]), only_new=True)
-        return
-
-    if action == "viewed":
+    elif action == "viewed":
         code = parts[1]
-        row_index = int(parts[2])
-        mark_viewed(sheet_by_code(code), row_index)
+        mark_viewed(sheet_by_code(code), int(parts[2]))
         show_records(chat_id, message_id, telegram_id, code, 0, only_new=True)
-        return
-
-    if action == "cats":
-        show_categories(chat_id, message_id, telegram_id, parts[1])
-        return
-
-    if action == "catopen":
-        show_records(chat_id, message_id, telegram_id, parts[1], 0, category=parts[2], only_new=False)
-        return
-
-    if action == "catpage":
-        show_records(chat_id, message_id, telegram_id, parts[1], int(parts[2]), category=parts[3], only_new=False)
-        return
+    elif action == "months":
+        show_months(chat_id, message_id, telegram_id, parts[1])
+    elif action == "cats":
+        show_categories(chat_id, message_id, telegram_id, parts[1], parts[2])
+    elif action == "catopen":
+        code = parts[1]
+        month_key = parts[2]
+        category = "|".join(parts[3:])
+        show_records(chat_id, message_id, telegram_id, code, 0, category=category, month_key=month_key, only_new=False)
+    elif action == "catpage":
+        code = parts[1]
+        index = int(parts[2])
+        month_key = parts[3]
+        category = "|".join(parts[4:])
+        show_records(chat_id, message_id, telegram_id, code, index, category=category, month_key=month_key, only_new=False)
 
 
 def handle_message(message: Dict[str, Any]):
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
-
     if text in ["/start", "/menu", "старт", "Старт"]:
         send_message(chat_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
     else:
@@ -372,27 +426,21 @@ def health():
 def webhook():
     update = request.get_json(force=True)
     logger.info("Incoming update: %s", update)
-
     try:
         if "message" in update:
             handle_message(update["message"])
-
         if "callback_query" in update:
             handle_callback(update["callback_query"])
-
     except Exception as e:
         logger.exception(e)
-
         try:
             if "message" in update:
                 chat_id = update["message"]["chat"]["id"]
             else:
                 chat_id = update["callback_query"]["message"]["chat"]["id"]
-
             send_message(chat_id, "❌ Сталася помилка. Напишіть адміністратору або спробуйте ще раз.")
         except Exception:
             pass
-
     return "ok"
 
 
