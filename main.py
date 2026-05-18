@@ -133,15 +133,20 @@ def button(text: str, callback_data: str) -> Dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
-def menu_keyboard():
-    return inline_keyboard([
+def menu_keyboard(telegram_id: Optional[int] = None):
+    buttons = [
         [
             button("🆕 Нові штрафи", "new|f"),
             button("⚠️ Нові попередження", "new|w"),
         ],
         [button("📂 Штрафи по категоріях", "months|f")],
         [button("📁 Попередження по категоріях", "months|w")],
-    ])
+    ]
+
+    if telegram_id and is_manager(telegram_id):
+        buttons.append([button("👑 Кабінет керівника", "mgr")])
+
+    return inline_keyboard(buttons)
 
 
 def back_menu_keyboard():
@@ -181,6 +186,233 @@ def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
 
     return None
 
+
+
+def get_employee_profile_by_tg(telegram_id: int) -> Optional[Dict[str, str]]:
+    try:
+        values = ws(SHEET_EMPLOYEES).get_all_values()
+        if not values:
+            return None
+
+        headers = values[0]
+        name_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Ім'я", "ПІБ співробітника"])
+        tg_col = find_col(headers, ["Telegram ID", "Телеграм ID", "telegram_id", "tg id", "TG ID"])
+        active_col = find_col(headers, ["Активний", "Активна", "Active"])
+        role_col = find_col(headers, ["Роль", "Role"])
+        manager_col = find_col(headers, ["Керівник", "Куратор", "Manager"])
+
+        if name_col is None or tg_col is None:
+            return None
+
+        for row in values[1:]:
+            def cell(col):
+                return normalize(row[col]) if col is not None and len(row) > col else ""
+
+            if cell(tg_col) == str(telegram_id):
+                return {
+                    "name": cell(name_col),
+                    "telegram_id": cell(tg_col),
+                    "active": cell(active_col),
+                    "role": cell(role_col),
+                    "manager": cell(manager_col),
+                }
+    except Exception as e:
+        logger.exception(e)
+
+    return None
+
+
+def is_manager(telegram_id: int) -> bool:
+    profile = get_employee_profile_by_tg(telegram_id)
+    if not profile:
+        return False
+    return profile.get("role", "").strip().lower() == "керівник"
+
+
+def get_manager_employees(manager_name: str) -> List[str]:
+    try:
+        values = ws(SHEET_EMPLOYEES).get_all_values()
+        if not values:
+            return []
+
+        headers = values[0]
+        name_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Ім'я", "ПІБ співробітника"])
+        manager_col = find_col(headers, ["Керівник", "Куратор", "Manager"])
+        active_col = find_col(headers, ["Активний", "Активна", "Active"])
+
+        if name_col is None or manager_col is None:
+            return []
+
+        result = []
+        for row in values[1:]:
+            def cell(col):
+                return normalize(row[col]) if col is not None and len(row) > col else ""
+
+            active = cell(active_col).lower()
+            if cell(manager_col) == manager_name and active in ["так", "", "yes", "true"]:
+                name = cell(name_col)
+                if name:
+                    result.append(name)
+
+        return result
+    except Exception as e:
+        logger.exception(e)
+        return []
+
+
+def get_team_records(sheet_name: str, employee_names: List[str]) -> List[Dict[str, Any]]:
+    if not employee_names:
+        return []
+
+    values = ws(sheet_name).get_all_values()
+    if not values:
+        return []
+
+    headers = values[0]
+    employee_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+
+    if employee_col is None:
+        return []
+
+    employee_set = set(employee_names)
+    result = []
+
+    for row_index, row in enumerate(values[1:], start=2):
+        employee = normalize(row[employee_col]) if len(row) > employee_col else ""
+        if employee in employee_set:
+            result.append({"row_index": row_index, "headers": headers, "row": row})
+
+    return result
+
+
+def amount_to_number(value: Any) -> float:
+    text = normalize(value).replace(" ", "").replace(",", ".")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def manager_keyboard():
+    return inline_keyboard([
+        [button("📊 Підсумок по моїх людях", "mgrsum")],
+        [button("💸 Штрафи моїх людей", "mgrrec|f|0")],
+        [button("⚠️ Попередження моїх людей", "mgrrec|w|0")],
+        [button("👥 Список моїх працівників", "mgrlist")],
+        [button("⬅️ Назад в меню", "menu")],
+    ])
+
+
+def show_manager_cabinet(chat_id: int, message_id: int, telegram_id: int):
+    if not is_manager(telegram_id):
+        edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
+        return
+
+    edit_message(chat_id, message_id, "👑 Кабінет керівника\n\nОберіть розділ:", manager_keyboard())
+
+
+def show_manager_list(chat_id: int, message_id: int, telegram_id: int):
+    profile = get_employee_profile_by_tg(telegram_id)
+    if not profile or not is_manager(telegram_id):
+        edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
+        return
+
+    employees = get_manager_employees(profile["name"])
+    if not employees:
+        text = "👥 Ваші працівники\n\nПрацівників не знайдено. Перевірте колонку «Керівник» у вкладці «Працівники»."
+    else:
+        lines = ["👥 Ваші працівники", ""]
+        for i, emp in enumerate(employees, start=1):
+            lines.append(f"{i}. {emp}")
+        text = "\n".join(lines)
+
+    edit_message(chat_id, message_id, text, inline_keyboard([
+        [button("⬅️ До кабінету керівника", "mgr")],
+        [button("⬅️ Назад в меню", "menu")],
+    ]))
+
+
+def show_manager_summary(chat_id: int, message_id: int, telegram_id: int):
+    profile = get_employee_profile_by_tg(telegram_id)
+    if not profile or not is_manager(telegram_id):
+        edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
+        return
+
+    employees = get_manager_employees(profile["name"])
+    if not employees:
+        edit_message(chat_id, message_id, "📊 Підсумок\n\nПрацівників не знайдено.", inline_keyboard([
+            [button("⬅️ До кабінету керівника", "mgr")],
+            [button("⬅️ Назад в меню", "menu")],
+        ]))
+        return
+
+    fine_records = get_team_records(SHEET_FINES, employees)
+    warning_records = get_team_records(SHEET_WARNINGS, employees)
+
+    summary = {emp: {"fine_count": 0, "fine_sum": 0.0, "warning_count": 0} for emp in employees}
+
+    for rec in fine_records:
+        emp = get_value(rec, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+        if emp in summary:
+            summary[emp]["fine_count"] += 1
+            summary[emp]["fine_sum"] += amount_to_number(get_value(rec, ["Сума", "Штраф", "Сума штрафу"]))
+
+    for rec in warning_records:
+        emp = get_value(rec, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+        if emp in summary:
+            summary[emp]["warning_count"] += 1
+
+    lines = ["📊 Підсумок по моїх людях", ""]
+    for emp in employees:
+        item = summary[emp]
+        fine_sum = int(item["fine_sum"]) if item["fine_sum"].is_integer() else round(item["fine_sum"], 2)
+        lines.append(f"👤 {emp}")
+        lines.append(f"💸 Штрафів: {item['fine_count']} / {fine_sum} грн")
+        lines.append(f"⚠️ Попереджень: {item['warning_count']}")
+        lines.append("")
+
+    edit_message(chat_id, message_id, "\n".join(lines).strip(), inline_keyboard([
+        [button("⬅️ До кабінету керівника", "mgr")],
+        [button("⬅️ Назад в меню", "menu")],
+    ]))
+
+
+def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: str, index: int = 0):
+    profile = get_employee_profile_by_tg(telegram_id)
+    if not profile or not is_manager(telegram_id):
+        edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
+        return
+
+    employees = get_manager_employees(profile["name"])
+    sheet_name = sheet_by_code(code)
+    records = get_team_records(sheet_name, employees)
+    title = "💸 Штрафи моїх людей" if code == "f" else "⚠️ Попередження моїх людей"
+
+    if not records:
+        edit_message(chat_id, message_id, title + "\n\nЗаписів не знайдено.", inline_keyboard([
+            [button("⬅️ До кабінету керівника", "mgr")],
+            [button("⬅️ Назад в меню", "menu")],
+        ]))
+        return
+
+    index = max(0, min(index, len(records) - 1))
+    text = build_record_text(title, records[index], index, len(records), sheet_name)
+
+    buttons = []
+    nav = []
+    if index > 0:
+        nav.append(button("⬅️ Назад", f"mgrrec|{code}|{index - 1}"))
+    if index < len(records) - 1:
+        nav.append(button("➡️ Далі", f"mgrrec|{code}|{index + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([button("⬅️ До кабінету керівника", "mgr")])
+    buttons.append([button("⬅️ Назад в меню", "menu")])
+
+    edit_message(chat_id, message_id, text, inline_keyboard(buttons))
 
 def get_fixation_date_col(headers: List[str]) -> Optional[int]:
     return find_col(headers, [
@@ -465,7 +697,7 @@ def handle_callback(callback_query: Dict[str, Any]):
     telegram_id = callback_query["from"]["id"]
 
     if action == "menu":
-        edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
+        edit_message(chat_id, message_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard(telegram_id))
         return
 
     if action == "new":
@@ -512,7 +744,7 @@ def handle_message(message: Dict[str, Any]):
     text = message.get("text", "")
 
     if text in ["/start", "/menu", "старт", "Старт"]:
-        send_message(chat_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard())
+        send_message(chat_id, "📋 Меню\n\nОберіть розділ:", menu_keyboard(message.get("from", {}).get("id")))
     else:
         send_message(chat_id, "Напишіть /start, щоб відкрити меню.")
 
