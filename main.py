@@ -133,6 +133,22 @@ def button(text: str, callback_data: str) -> Dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
+def menu_keyboard(telegram_id: Optional[int] = None):
+    buttons = [
+        [
+            button("🆕 Нові штрафи", "new|f"),
+            button("⚠️ Нові попередження", "new|w"),
+        ],
+        [button("📂 Штрафи по категоріях", "months|f")],
+        [button("📁 Попередження по категоріях", "months|w")],
+    ]
+
+    if telegram_id and is_manager(telegram_id):
+        buttons.append([button("👑 Кабінет керівника", "mgr")])
+
+    return inline_keyboard(buttons)
+
+
 def back_menu_keyboard():
     return inline_keyboard([[button("⬅️ Назад в меню", "menu")]])
 
@@ -169,6 +185,7 @@ def get_employee_name_by_tg(telegram_id: int) -> Optional[str]:
         logger.exception(e)
 
     return None
+
 
 
 def get_employee_profile_by_tg(telegram_id: int) -> Optional[Dict[str, str]]:
@@ -212,22 +229,6 @@ def is_manager(telegram_id: int) -> bool:
     return profile.get("role", "").strip().lower() == "керівник"
 
 
-def menu_keyboard(telegram_id: Optional[int] = None):
-    buttons = [
-        [
-            button("🆕 Нові штрафи", "new|f"),
-            button("⚠️ Нові попередження", "new|w"),
-        ],
-        [button("📂 Штрафи по категоріях", "months|f")],
-        [button("📁 Попередження по категоріях", "months|w")],
-    ]
-
-    if telegram_id and is_manager(telegram_id):
-        buttons.append([button("👑 Кабінет керівника", "mgr")])
-
-    return inline_keyboard(buttons)
-
-
 def get_manager_employees(manager_name: str) -> List[str]:
     try:
         values = ws(SHEET_EMPLOYEES).get_all_values()
@@ -259,7 +260,7 @@ def get_manager_employees(manager_name: str) -> List[str]:
         return []
 
 
-def get_team_records(sheet_name: str, employee_names: List[str]) -> List[Dict[str, Any]]:
+def get_team_records(sheet_name: str, employee_names: List[str], month_key: Optional[str] = None) -> List[Dict[str, Any]]:
     if not employee_names:
         return []
 
@@ -269,6 +270,7 @@ def get_team_records(sheet_name: str, employee_names: List[str]) -> List[Dict[st
 
     headers = values[0]
     employee_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+    fixation_date_col = get_fixation_date_col(headers)
 
     if employee_col is None:
         return []
@@ -278,11 +280,52 @@ def get_team_records(sheet_name: str, employee_names: List[str]) -> List[Dict[st
 
     for row_index, row in enumerate(values[1:], start=2):
         employee = normalize(row[employee_col]) if len(row) > employee_col else ""
-        if employee in employee_set:
-            result.append({"row_index": row_index, "headers": headers, "row": row})
+        if employee not in employee_set:
+            continue
+
+        if month_key:
+            if fixation_date_col is None:
+                continue
+            date_value = normalize(row[fixation_date_col]) if len(row) > fixation_date_col else ""
+            if month_key_from_date(date_value) != month_key:
+                continue
+
+        result.append({"row_index": row_index, "headers": headers, "row": row})
 
     return result
 
+
+def get_team_months(employee_names: List[str]) -> List[str]:
+    months = set()
+
+    for sheet_name in [SHEET_FINES, SHEET_WARNINGS]:
+        if not employee_names:
+            continue
+
+        values = ws(sheet_name).get_all_values()
+        if not values:
+            continue
+
+        headers = values[0]
+        employee_col = find_col(headers, ["Співробітник", "ПІБ", "Працівник", "Менеджер"])
+        fixation_date_col = get_fixation_date_col(headers)
+
+        if employee_col is None or fixation_date_col is None:
+            continue
+
+        employee_set = set(employee_names)
+
+        for row in values[1:]:
+            employee = normalize(row[employee_col]) if len(row) > employee_col else ""
+            if employee not in employee_set:
+                continue
+
+            date_value = normalize(row[fixation_date_col]) if len(row) > fixation_date_col else ""
+            key = month_key_from_date(date_value)
+            if key:
+                months.add(key)
+
+    return sorted(months, reverse=True)
 
 def amount_to_number(value: Any) -> float:
     text = normalize(value).replace(" ", "").replace(",", ".")
@@ -296,9 +339,9 @@ def amount_to_number(value: Any) -> float:
 
 def manager_keyboard():
     return inline_keyboard([
-        [button("📊 Підсумок по моїх людях", "mgrsum")],
-        [button("💸 Штрафи моїх людей", "mgrrec|f|0")],
-        [button("⚠️ Попередження моїх людей", "mgrrec|w|0")],
+        [button("📊 Підсумок по моїх людях", "mgrmonths|sum")],
+        [button("💸 Штрафи моїх людей", "mgrmonths|f")],
+        [button("⚠️ Попередження моїх людей", "mgrmonths|w")],
         [button("👥 Список моїх працівників", "mgrlist")],
         [button("⬅️ Назад в меню", "menu")],
     ])
@@ -333,7 +376,43 @@ def show_manager_list(chat_id: int, message_id: int, telegram_id: int):
     ]))
 
 
-def show_manager_summary(chat_id: int, message_id: int, telegram_id: int):
+def show_manager_months(chat_id: int, message_id: int, telegram_id: int, mode: str):
+    profile = get_employee_profile_by_tg(telegram_id)
+    if not profile or not is_manager(telegram_id):
+        edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
+        return
+
+    employees = get_manager_employees(profile["name"])
+    months = get_team_months(employees)
+
+    if mode == "sum":
+        title = "📊 Підсумок по моїх людях"
+    elif mode == "f":
+        title = "💸 Штрафи моїх людей"
+    else:
+        title = "⚠️ Попередження моїх людей"
+
+    if not months:
+        edit_message(chat_id, message_id, title + "\n\nМісяців не знайдено.", inline_keyboard([
+            [button("⬅️ До кабінету керівника", "mgr")],
+            [button("⬅️ Назад в меню", "menu")],
+        ]))
+        return
+
+    buttons = []
+    for m in months:
+        if mode == "sum":
+            buttons.append([button("🗓 " + month_label(m), f"mgrsum|{m}")])
+        else:
+            buttons.append([button("🗓 " + month_label(m), f"mgrrec|{mode}|{m}|0")])
+
+    buttons.append([button("⬅️ До кабінету керівника", "mgr")])
+    buttons.append([button("⬅️ Назад в меню", "menu")])
+
+    edit_message(chat_id, message_id, title + "\n\n🗓 Оберіть місяць:", inline_keyboard(buttons))
+
+
+def show_manager_summary(chat_id: int, message_id: int, telegram_id: int, month_key: str):
     profile = get_employee_profile_by_tg(telegram_id)
     if not profile or not is_manager(telegram_id):
         edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
@@ -347,8 +426,8 @@ def show_manager_summary(chat_id: int, message_id: int, telegram_id: int):
         ]))
         return
 
-    fine_records = get_team_records(SHEET_FINES, employees)
-    warning_records = get_team_records(SHEET_WARNINGS, employees)
+    fine_records = get_team_records(SHEET_FINES, employees, month_key=month_key)
+    warning_records = get_team_records(SHEET_WARNINGS, employees, month_key=month_key)
 
     summary = {emp: {"fine_count": 0, "fine_sum": 0.0, "warning_count": 0} for emp in employees}
 
@@ -363,7 +442,7 @@ def show_manager_summary(chat_id: int, message_id: int, telegram_id: int):
         if emp in summary:
             summary[emp]["warning_count"] += 1
 
-    lines = ["📊 Підсумок по моїх людях", ""]
+    lines = [f"📊 Підсумок по моїх людях", f"🗓 {month_label(month_key)}", ""]
     for emp in employees:
         item = summary[emp]
         fine_sum = int(item["fine_sum"]) if item["fine_sum"].is_integer() else round(item["fine_sum"], 2)
@@ -373,12 +452,13 @@ def show_manager_summary(chat_id: int, message_id: int, telegram_id: int):
         lines.append("")
 
     edit_message(chat_id, message_id, "\n".join(lines).strip(), inline_keyboard([
+        [button("⬅️ До місяців", "mgrmonths|sum")],
         [button("⬅️ До кабінету керівника", "mgr")],
         [button("⬅️ Назад в меню", "menu")],
     ]))
 
 
-def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: str, index: int = 0):
+def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: str, month_key: str, index: int = 0):
     profile = get_employee_profile_by_tg(telegram_id)
     if not profile or not is_manager(telegram_id):
         edit_message(chat_id, message_id, "У вас немає доступу до кабінету керівника.", back_menu_keyboard())
@@ -386,11 +466,13 @@ def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: 
 
     employees = get_manager_employees(profile["name"])
     sheet_name = sheet_by_code(code)
-    records = get_team_records(sheet_name, employees)
-    title = "💸 Штрафи моїх людей" if code == "f" else "⚠️ Попередження моїх людей"
+    records = get_team_records(sheet_name, employees, month_key=month_key)
+    base_title = "💸 Штрафи моїх людей" if code == "f" else "⚠️ Попередження моїх людей"
+    title = f"{base_title}\n🗓 {month_label(month_key)}"
 
     if not records:
         edit_message(chat_id, message_id, title + "\n\nЗаписів не знайдено.", inline_keyboard([
+            [button("⬅️ До місяців", f"mgrmonths|{code}")],
             [button("⬅️ До кабінету керівника", "mgr")],
             [button("⬅️ Назад в меню", "menu")],
         ]))
@@ -402,17 +484,17 @@ def show_manager_records(chat_id: int, message_id: int, telegram_id: int, code: 
     buttons = []
     nav = []
     if index > 0:
-        nav.append(button("⬅️ Назад", f"mgrrec|{code}|{index - 1}"))
+        nav.append(button("⬅️ Назад", f"mgrrec|{code}|{month_key}|{index - 1}"))
     if index < len(records) - 1:
-        nav.append(button("➡️ Далі", f"mgrrec|{code}|{index + 1}"))
+        nav.append(button("➡️ Далі", f"mgrrec|{code}|{month_key}|{index + 1}"))
     if nav:
         buttons.append(nav)
 
+    buttons.append([button("⬅️ До місяців", f"mgrmonths|{code}")])
     buttons.append([button("⬅️ До кабінету керівника", "mgr")])
     buttons.append([button("⬅️ Назад в меню", "menu")])
 
     edit_message(chat_id, message_id, text, inline_keyboard(buttons))
-
 
 def get_fixation_date_col(headers: List[str]) -> Optional[int]:
     return find_col(headers, [
@@ -746,14 +828,19 @@ def handle_callback(callback_query: Dict[str, Any]):
         show_manager_list(chat_id, message_id, telegram_id)
         return
 
+    if action == "mgrmonths":
+        show_manager_months(chat_id, message_id, telegram_id, parts[1])
+        return
+
     if action == "mgrsum":
-        show_manager_summary(chat_id, message_id, telegram_id)
+        show_manager_summary(chat_id, message_id, telegram_id, parts[1])
         return
 
     if action == "mgrrec":
         code = parts[1]
-        index = int(parts[2])
-        show_manager_records(chat_id, message_id, telegram_id, code, index)
+        month_key = parts[2]
+        index = int(parts[3])
+        show_manager_records(chat_id, message_id, telegram_id, code, month_key, index)
         return
 
 
